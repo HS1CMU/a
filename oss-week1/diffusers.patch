@@ -1,0 +1,54 @@
+From 85b26f2d38196aab9e7dbc6d8feb00694cf21f11 Mon Sep 17 00:00:00 2001
+From: HS1CMU <the.heathsun@gmail.com>
+Date: Thu, 24 Sep 2026 03:16:25 +0000
+Subject: [PATCH] Fix EDMEulerScheduler.set_timesteps crashing when sigmas is a
+ list
+
+set_timesteps annotates sigmas as torch.Tensor | list[float], but only the tensor and float branches
+were handled, so passing a list raised AttributeError: 'list' object has no attribute 'to'.
+Convert lists with torch.tensor the same way floats are.
+---
+ src/diffusers/schedulers/scheduling_edm_euler.py |  2 +-
+ tests/schedulers/test_scheduler_edm_euler.py     | 13 +++++++++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/diffusers/schedulers/scheduling_edm_euler.py b/src/diffusers/schedulers/scheduling_edm_euler.py
+index dfb70ce..a7b78ff 100644
+--- a/src/diffusers/schedulers/scheduling_edm_euler.py
++++ b/src/diffusers/schedulers/scheduling_edm_euler.py
+@@ -293,7 +293,7 @@ class EDMEulerScheduler(SchedulerMixin, ConfigMixin):
+         sigmas_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+         if sigmas is None:
+             sigmas = torch.linspace(0, 1, self.num_inference_steps, dtype=sigmas_dtype)
+-        elif isinstance(sigmas, float):
++        elif isinstance(sigmas, (float, list)):
+             sigmas = torch.tensor(sigmas, dtype=sigmas_dtype)
+         else:
+             sigmas = sigmas.to(sigmas_dtype)
+diff --git a/tests/schedulers/test_scheduler_edm_euler.py b/tests/schedulers/test_scheduler_edm_euler.py
+index acac4b1..c4abe27 100644
+--- a/tests/schedulers/test_scheduler_edm_euler.py
++++ b/tests/schedulers/test_scheduler_edm_euler.py
+@@ -80,6 +80,19 @@ class EDMEulerSchedulerTest(SchedulerCommonTest):
+         assert abs(result_sum.item() - 34.1855) < 1e-3
+         assert abs(result_mean.item() - 0.044) < 1e-3
+ 
++    def test_custom_sigmas_as_list(self):
++        scheduler = self.scheduler_classes[0](**self.get_scheduler_config())
++        ramp = [0.0, 0.5, 1.0]
++
++        scheduler.set_timesteps(sigmas=ramp)
++        sigmas_from_list = scheduler.sigmas
++
++        scheduler.set_timesteps(sigmas=torch.tensor(ramp))
++        assert torch.equal(sigmas_from_list, scheduler.sigmas)
++
++        scheduler.set_timesteps(num_inference_steps=len(ramp))
++        assert torch.allclose(sigmas_from_list, scheduler.sigmas)
++
+     # Override test_from_save_pretrained to use EDMEulerScheduler-specific logic
+     def test_from_save_pretrained(self):
+         kwargs = dict(self.forward_default_kwargs)
+-- 
+2.43.0
+
