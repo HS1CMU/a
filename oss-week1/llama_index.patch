@@ -1,0 +1,84 @@
+From 68062dc9ef2b3398702af044dafe4826486340ea Mon Sep 17 00:00:00 2001
+From: HS1CMU <the.heathsun@gmail.com>
+Date: Thu, 24 Sep 2026 03:16:41 +0000
+Subject: [PATCH] fix(core): parse HTML tables with <th> header cells in
+ html_to_df
+
+html_to_df only collected <td> cells per row, so a table whose header row
+uses <th> cells produced an empty first row. The subsequent "all rows have
+the same number of columns" check then failed and the function returned
+None. UnstructuredElementNodeParser.filter_table relies on that return
+value, so every <th>-headed table (which is what unstructured emits in
+text_as_html for standard HTML tables) was silently demoted to plain text
+instead of being extracted as a table/IndexNode.
+
+Collect both <td> and <th> cells per row. Add regression tests for
+html_to_df and for end-to-end table extraction through
+UnstructuredElementNodeParser.
+---
+ .../core/node_parser/relational/utils.py      |  5 ++-
+ .../tests/node_parser/test_unstructured.py    | 35 +++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/llama-index-core/llama_index/core/node_parser/relational/utils.py b/llama-index-core/llama_index/core/node_parser/relational/utils.py
+index 4d51c83..6725276 100644
+--- a/llama-index-core/llama_index/core/node_parser/relational/utils.py
++++ b/llama-index-core/llama_index/core/node_parser/relational/utils.py
+@@ -59,7 +59,10 @@ def html_to_df(html_str: str) -> Any:
+ 
+     data = []
+     for row in rows:
+-        cols = row.xpath(".//td")
++        # Header rows commonly use <th> cells; include them so the header is
++        # not dropped (which would leave the first row empty and make the
++        # column-count check below fail for every table with a <th> header).
++        cols = row.xpath(".//td|.//th")
+         cols = [c.text.strip() if c.text is not None else "" for c in cols]
+         data.append(cols)
+ 
+diff --git a/llama-index-core/tests/node_parser/test_unstructured.py b/llama-index-core/tests/node_parser/test_unstructured.py
+index 4c97959..7ad24a7 100644
+--- a/llama-index-core/tests/node_parser/test_unstructured.py
++++ b/llama-index-core/tests/node_parser/test_unstructured.py
+@@ -103,3 +103,38 @@ def test_html_table_extraction() -> None:
+     assert isinstance(nodes[3], TextNode)
+     assert isinstance(nodes[4], IndexNode)
+     assert isinstance(nodes[5], TextNode)
++
++
++TH_HEADER_TABLE = (
++    "<table><thead><tr><th>Year</th><th>Benefits</th></tr></thead>"
++    "<tbody><tr><td>2020</td><td>12,000</td></tr>"
++    "<tr><td>2021</td><td>10,000</td></tr></tbody></table>"
++)
++
++
++@pytest.mark.skipif(html is None, reason="lxml not installed")
++def test_html_to_df_with_th_header() -> None:
++    """Tables whose header row uses <th> cells must still be parsed."""
++    from llama_index.core.node_parser.relational.utils import html_to_df
++
++    table_df = html_to_df(TH_HEADER_TABLE)
++
++    assert table_df is not None
++    assert list(table_df.columns) == ["Year", "Benefits"]
++    assert table_df.values.tolist() == [["2020", "12,000"], ["2021", "10,000"]]
++
++
++@pytest.mark.skipif(partition_html is None, reason="unstructured not installed")
++@pytest.mark.skipif(html is None, reason="lxml not installed")
++def test_html_table_extraction_with_th_header() -> None:
++    """A <th>-headed table is extracted as a table node, not demoted to text."""
++    test_data = Document(
++        text=f"<html><body><p>Intro</p>{TH_HEADER_TABLE}<p>Outro</p></body></html>"
++    )
++
++    node_parser = UnstructuredElementNodeParser(llm=MockLLM())
++    nodes = node_parser.get_nodes_from_documents([test_data])
++
++    index_nodes = [n for n in nodes if isinstance(n, IndexNode)]
++    assert len(index_nodes) == 1
++    assert "Benefits" in index_nodes[0].get_content()
+-- 
+2.43.0
+
