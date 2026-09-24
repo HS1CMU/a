@@ -1,0 +1,184 @@
+From ec6d43e220421759e1946675ed7b4b54146e7a37 Mon Sep 17 00:00:00 2001
+From: HS1CMU <the.heathsun@gmail.com>
+Date: Thu, 24 Sep 2026 03:15:14 +0000
+Subject: [PATCH] fix(otel): emit temperature, top_p and max_tokens span
+ attributes when set to 0
+
+The legacy OpenTelemetry callback and the Arize/Phoenix logger gated the
+llm request attributes on truthiness, so a request with temperature 0 or
+top_p 0 produced a span with no gen_ai.request.temperature or
+gen_ai.request.top_p attribute at all. The gen_ai semconv path and the OTel
+v2 mappers already treat 0 as a real value, so this brings the two legacy
+paths in line with them by checking for None instead
+---
+ litellm/integrations/arize/_utils.py          |  6 +--
+ litellm/integrations/opentelemetry.py         |  6 +--
+ .../integrations/arize/test_arize_utils.py    | 40 +++++++++++++++
+ .../integrations/test_opentelemetry.py        | 50 +++++++++++++++++++
+ 4 files changed, 96 insertions(+), 6 deletions(-)
+
+diff --git a/litellm/integrations/arize/_utils.py b/litellm/integrations/arize/_utils.py
+index 0271cf1..2b1dceb 100644
+--- a/litellm/integrations/arize/_utils.py
++++ b/litellm/integrations/arize/_utils.py
+@@ -529,11 +529,11 @@ def _set_request_attributes(
+         litellm_params.get("custom_llm_provider", "Unknown"),
+     )
+ 
+-    if optional_params.get("max_tokens"):
++    if optional_params.get("max_tokens") is not None:
+         safe_set_attribute(span, "llm.request.max_tokens", optional_params.get("max_tokens"))
+-    if optional_params.get("temperature"):
++    if optional_params.get("temperature") is not None:
+         safe_set_attribute(span, "llm.request.temperature", optional_params.get("temperature"))
+-    if optional_params.get("top_p"):
++    if optional_params.get("top_p") is not None:
+         safe_set_attribute(span, "llm.request.top_p", optional_params.get("top_p"))
+ 
+     safe_set_attribute(span, "llm.is_streaming", str(optional_params.get("stream", False)))
+diff --git a/litellm/integrations/opentelemetry.py b/litellm/integrations/opentelemetry.py
+index 749f0ce..ed9f025 100644
+--- a/litellm/integrations/opentelemetry.py
++++ b/litellm/integrations/opentelemetry.py
+@@ -2467,7 +2467,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
+                 )
+ 
+             # The maximum number of tokens the LLM generates for a request.
+-            if optional_params.get("max_tokens"):
++            if optional_params.get("max_tokens") is not None:
+                 self.safe_set_attribute(
+                     span=span,
+                     key=SpanAttributes.LLM_REQUEST_MAX_TOKENS.value,
+@@ -2475,7 +2475,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
+                 )
+ 
+             # The temperature setting for the LLM request.
+-            if optional_params.get("temperature"):
++            if optional_params.get("temperature") is not None:
+                 self.safe_set_attribute(
+                     span=span,
+                     key=SpanAttributes.LLM_REQUEST_TEMPERATURE.value,
+@@ -2483,7 +2483,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
+                 )
+ 
+             # The top_p sampling setting for the LLM request.
+-            if optional_params.get("top_p"):
++            if optional_params.get("top_p") is not None:
+                 self.safe_set_attribute(
+                     span=span,
+                     key=SpanAttributes.LLM_REQUEST_TOP_P.value,
+diff --git a/tests/test_litellm/integrations/arize/test_arize_utils.py b/tests/test_litellm/integrations/arize/test_arize_utils.py
+index 167b083..b358d76 100644
+--- a/tests/test_litellm/integrations/arize/test_arize_utils.py
++++ b/tests/test_litellm/integrations/arize/test_arize_utils.py
+@@ -181,6 +181,46 @@ def test_arize_set_attributes():
+     span.set_attribute.assert_any_call(SpanAttributes.LLM_TOKEN_COUNT_PROMPT, 40)
+ 
+ 
++def test_arize_set_attributes_emits_zero_valued_sampling_params():
++    """temperature=0 and top_p=0 are real settings and must reach the span, not be dropped as falsy."""
++    from unittest.mock import MagicMock
++
++    span = MagicMock()
++    kwargs = {
++        "model": "gpt-4o",
++        "messages": [{"role": "user", "content": "hi"}],
++        "standard_logging_object": {"metadata": {}, "call_type": "completion"},
++        "optional_params": {"temperature": 0, "top_p": 0.0, "max_tokens": 0},
++        "litellm_params": {"custom_llm_provider": "openai"},
++    }
++
++    ArizeLogger.set_arize_attributes(span, kwargs, None)
++
++    span.set_attribute.assert_any_call("llm.request.temperature", 0)
++    span.set_attribute.assert_any_call("llm.request.top_p", 0.0)
++    span.set_attribute.assert_any_call("llm.request.max_tokens", 0)
++
++
++def test_arize_set_attributes_skips_absent_sampling_params():
++    from unittest.mock import MagicMock
++
++    span = MagicMock()
++    kwargs = {
++        "model": "gpt-4o",
++        "messages": [{"role": "user", "content": "hi"}],
++        "standard_logging_object": {"metadata": {}, "call_type": "completion"},
++        "optional_params": {"temperature": None},
++        "litellm_params": {"custom_llm_provider": "openai"},
++    }
++
++    ArizeLogger.set_arize_attributes(span, kwargs, None)
++
++    keys = {c.args[0] for c in span.set_attribute.call_args_list if c.args}
++    assert "llm.request.temperature" not in keys
++    assert "llm.request.top_p" not in keys
++    assert "llm.request.max_tokens" not in keys
++
++
+ def test_arize_set_attributes_responses_api():
+     """
+     Test setting attributes for Responses API with mixed output (reasoning + message).
+diff --git a/tests/test_litellm/integrations/test_opentelemetry.py b/tests/test_litellm/integrations/test_opentelemetry.py
+index 974961f..58e2296 100644
+--- a/tests/test_litellm/integrations/test_opentelemetry.py
++++ b/tests/test_litellm/integrations/test_opentelemetry.py
+@@ -402,6 +402,56 @@ class TestOpenTelemetryCostBreakdown(unittest.TestCase):
+         assert ("gen_ai.cost.original_cost", 0.004) not in call_args_list
+ 
+ 
++class TestOpenTelemetryZeroValuedRequestParams(unittest.TestCase):
++    def test_zero_valued_sampling_params_are_emitted(self):
++        """temperature=0 and top_p=0 are real settings and must reach the span, not be dropped as falsy."""
++        from litellm.proxy._types import SpanAttributes
++
++        otel = OpenTelemetry()
++        mock_span = MagicMock()
++        kwargs = {
++            "model": "gpt-4",
++            "messages": [{"role": "user", "content": "Hello"}],
++            "optional_params": {"temperature": 0, "top_p": 0.0, "max_tokens": 0},
++            "litellm_params": {"custom_llm_provider": "openai"},
++            "standard_logging_object": {
++                "id": "test-id",
++                "call_type": "completion",
++                "metadata": {},
++            },
++        }
++
++        otel.set_attributes(span=mock_span, kwargs=kwargs, response_obj=None)
++
++        mock_span.set_attribute.assert_any_call(SpanAttributes.LLM_REQUEST_TEMPERATURE.value, 0)
++        mock_span.set_attribute.assert_any_call(SpanAttributes.LLM_REQUEST_TOP_P.value, 0.0)
++        mock_span.set_attribute.assert_any_call(SpanAttributes.LLM_REQUEST_MAX_TOKENS.value, 0)
++
++    def test_absent_sampling_params_are_not_emitted(self):
++        from litellm.proxy._types import SpanAttributes
++
++        otel = OpenTelemetry()
++        mock_span = MagicMock()
++        kwargs = {
++            "model": "gpt-4",
++            "messages": [{"role": "user", "content": "Hello"}],
++            "optional_params": {"temperature": None},
++            "litellm_params": {"custom_llm_provider": "openai"},
++            "standard_logging_object": {
++                "id": "test-id",
++                "call_type": "completion",
++                "metadata": {},
++            },
++        }
++
++        otel.set_attributes(span=mock_span, kwargs=kwargs, response_obj=None)
++
++        keys = {c.args[0] for c in mock_span.set_attribute.call_args_list if c.args}
++        self.assertNotIn(SpanAttributes.LLM_REQUEST_TEMPERATURE.value, keys)
++        self.assertNotIn(SpanAttributes.LLM_REQUEST_TOP_P.value, keys)
++        self.assertNotIn(SpanAttributes.LLM_REQUEST_MAX_TOKENS.value, keys)
++
++
+ class TestOpenTelemetryProviderInitialization(unittest.TestCase):
+     """Test suite for verifying provider initialization respects existing providers"""
+ 
+-- 
+2.43.0
+
