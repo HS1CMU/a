@@ -1,0 +1,68 @@
+From 9e3667bd8eeb49037f53e237ac1a928695c7cd58 Mon Sep 17 00:00:00 2001
+From: HS1CMU <the.heathsun@gmail.com>
+Date: Thu, 24 Sep 2026 03:30:35 +0000
+Subject: [PATCH] FIX Choose new active adapter across all layers after
+ delete_adapter
+
+When the deleted adapter and the remaining adapters target different
+modules, the first tuner layer visited by delete_adapter may not host any
+adapter anymore after the deletion. Its (empty) active_adapters was used
+as the new active adapter for the whole model, leaving PeftModel with a
+stale active adapter and forward raising a KeyError.
+
+Keep looking until a layer with a remaining active adapter is found,
+mirroring what MixedModel.delete_adapter already does.
+---
+ src/peft/tuners/tuners_utils.py |  4 +++-
+ tests/test_custom_models.py     | 20 ++++++++++++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/peft/tuners/tuners_utils.py b/src/peft/tuners/tuners_utils.py
+index e9094bb..d05b06a 100644
+--- a/src/peft/tuners/tuners_utils.py
++++ b/src/peft/tuners/tuners_utils.py
+@@ -2701,7 +2701,9 @@ def delete_adapter(
+             continue
+         if isinstance(target, layer_cls):
+             target.delete_adapter(adapter_name)
+-            if new_adapter is None:
++            # Adapters can target different layers, so a layer that only hosted the deleted adapter is left without
++            # any active adapter. Keep looking until a layer with a remaining active adapter is found.
++            if not new_adapter:
+                 new_adapter = target.active_adapters[:]
+ 
+     _delete_auxiliary_adapter(model, adapter_name=adapter_name, new_active_adapters=new_adapter)
+diff --git a/tests/test_custom_models.py b/tests/test_custom_models.py
+index b7af802..be346d9 100644
+--- a/tests/test_custom_models.py
++++ b/tests/test_custom_models.py
+@@ -4094,6 +4094,26 @@ class TestPeftCustomModel(PeftCommonTester):
+         assert model.active_adapters == ["adapter1"]
+         model(**inputs)  # does not raise
+ 
++    def test_delete_active_adapter_with_adapters_targeting_different_modules(self):
++        # The active adapter targets lin0 and the other adapter targets lin1. After deleting the active adapter, the
++        # remaining adapter should become active and forward should work. Previously, the new active adapter was
++        # taken from the first tuner layer (lin0), which had no adapter left, so the model ended up with no active
++        # adapter and forward raised a KeyError.
++        config0 = LoraConfig(target_modules=["lin0"])
++        config1 = LoraConfig(target_modules=["lin1"])
++        model = get_peft_model(MLP(), config0, adapter_name="adapter0").to(self.torch_device)
++        model.add_adapter("adapter1", config1)
++
++        inputs = self.prepare_inputs_for_testing()
++        assert model.active_adapters == ["adapter0"]
++        model(**inputs)  # does not raise
++
++        model.delete_adapter("adapter0")
++        assert model.active_adapters == ["adapter1"]
++        assert model.active_adapter == "adapter1"
++        assert model.base_model.model.lin1.active_adapters == ["adapter1"]
++        model(**inputs)  # does not raise
++
+     def test_delete_adapter_multiple_adapters_with_modules_to_save(self):
+         # There are 3 adapters. Adapter 0 has modules_to_save. Delete it, we should switch to adapter 1, which does not
+         # have modules_to_save. Then, we delete it too, switching to adapter 2, which has modules_to_save. Finally, we
+-- 
+2.43.0
+
