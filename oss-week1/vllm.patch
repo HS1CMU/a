@@ -1,0 +1,154 @@
+From c90838dd01056bf85972b1d78592a639019af8f3 Mon Sep 17 00:00:00 2001
+From: HS1CMU <the.heathsun@gmail.com>
+Date: Thu, 24 Sep 2026 03:20:46 +0000
+Subject: [PATCH] [Bugfix][Frontend] Treat empty `tools` list as no tools in
+ Anthropic Messages API
+
+`AnthropicServingMessages._convert_tools` only skipped conversion when
+`tools` was `None`. A request with `tools: []` was converted into a
+`ChatCompletionRequest` with `tools=[]` and `tool_choice="auto"` by
+attribute assignment, bypassing the OpenAI request validator that rejects
+an empty tools array. On a server started without
+`--enable-auto-tool-choice`/`--tool-call-parser` the chat renderer then
+rejected the request with HTTP 400:
+
+    "auto" tool choice requires --enable-auto-tool-choice and
+    --tool-call-parser to be set
+
+even though the client asked for no tools at all. `/v1/messages/count_tokens`
+shares the same conversion path.
+
+Treat an empty `tools` list like an omitted `tools` field, matching how
+the OpenAI endpoint behaves when no tools are sent.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: HS1CMU <the.heathsun@gmail.com>
+---
+ .../test_anthropic_messages_conversion.py     | 70 ++++++++++++++++++-
+ vllm/entrypoints/anthropic/serving.py         |  7 +-
+ 2 files changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+index 226908d..0b2bf6d 100644
+--- a/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
++++ b/tests/entrypoints/anthropic/test_anthropic_messages_conversion.py
+@@ -12,11 +12,12 @@ blocks echoed back by Anthropic clients, and streaming conversion in
+ Also covers cache usage computation in ``_build_anthropic_usage``.
+ """
+ 
++import asyncio
+ import json
+ from argparse import Namespace
+ from http import HTTPStatus
+ from typing import Annotated
+-from unittest.mock import MagicMock
++from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+ from fastapi import FastAPI
+@@ -44,11 +45,16 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionStreamResponse,
+     ChatMessage,
+ )
+-from vllm.entrypoints.serve.engine.protocol import PromptTokenUsageInfo, UsageInfo
++from vllm.entrypoints.serve.engine.protocol import (
++    ErrorResponse,
++    PromptTokenUsageInfo,
++    UsageInfo,
++)
+ from vllm.entrypoints.serve.exception_handling.handlers.validation import (
+     validation_exception_handler,
+ )
+ from vllm.exceptions import VLLMValidationError
++from vllm.renderers.online_renderer import OnlineRenderer
+ 
+ _convert = AnthropicServingMessages.to_chat_completion_request
+ _img_url = AnthropicServingMessages._convert_image_source_to_url
+@@ -231,6 +237,66 @@ class TestVllmXargs:
+         }
+ 
+ 
++# ======================================================================
++# tools conversion
++# ======================================================================
++
++
++class TestToolsConversion:
++    _USER = [{"role": "user", "content": "Hello"}]
++    _TOOL = {
++        "name": "get_weather",
++        "description": "Get the weather",
++        "input_schema": {"type": "object", "properties": {}},
++    }
++
++    def test_tools_default_tool_choice_to_auto(self):
++        result = _convert(_make_request(self._USER, tools=[self._TOOL]))
++
++        assert result.tools is not None
++        assert [t.function.name for t in result.tools] == ["get_weather"]
++        assert result.tool_choice == "auto"
++
++    def test_empty_tools_is_treated_as_no_tools(self):
++        """``tools: []`` must convert like an omitted ``tools`` field.
++
++        Converting it to ``tools=[]`` + ``tool_choice="auto"`` makes the
++        renderer reject the request with an error about
++        ``--enable-auto-tool-choice`` on servers that run without a tool
++        parser, even though the client asked for no tools at all.
++        """
++        result = _convert(_make_request(self._USER, tools=[]))
++        baseline = _convert(_make_request(self._USER))
++
++        assert result.tools is None
++        assert result.tool_choice == baseline.tool_choice
++        assert result.tool_choice != "auto"
++
++    def test_empty_tools_not_rejected_by_renderer_without_tool_parser(self):
++        """End-to-end through the chat renderer with default server flags."""
++        model_config = MagicMock()
++        model_config.model = "test-model"
++        model_config.hf_config.model_type = "llama"
++        renderer = OnlineRenderer(
++            model_config,
++            MagicMock(),
++            request_logger=None,
++            chat_template=None,
++            chat_template_content_format="auto",
++        )
++        assert renderer.parser is None
++
++        chat_request = _convert(_make_request(self._USER, tools=[]))
++        # Stop before templating: any error here would come from the
++        # tool_choice validation that runs first.
++        renderer.validate_chat_template = MagicMock(return_value=None)
++        renderer.preprocess_chat = AsyncMock(return_value=([], []))
++
++        result = asyncio.run(renderer.render_chat(chat_request))
++
++        assert not isinstance(result, ErrorResponse), result
++
++
+ # ======================================================================
+ # tool_result content handling
+ # ======================================================================
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+index 6cc1271..bf41103 100644
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -566,7 +566,12 @@ class AnthropicServingMessages(OpenAIServingChat):
+         req: ChatCompletionRequest,
+     ) -> None:
+         """Convert Anthropic tools to OpenAI format."""
+-        if anthropic_request.tools is None:
++        # Treat ``tools: []`` like an omitted ``tools`` field. Converting it
++        # to ``tools=[]`` with ``tool_choice="auto"`` bypasses the OpenAI
++        # request validation (which rejects an empty tools array) and makes
++        # the renderer reject the request with an error about
++        # ``--enable-auto-tool-choice`` when no tool parser is configured.
++        if not anthropic_request.tools:
+             return
+ 
+         tools = []
+-- 
+2.43.0
+
